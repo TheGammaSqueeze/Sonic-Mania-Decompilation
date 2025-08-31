@@ -8,6 +8,15 @@
 #include "Game.h"
 #include <time.h>
 
+#ifndef PRINT_NORMAL
+#define PRINT_NORMAL 0
+#endif
+#define BSS_LOG(...) RSDK.PrintLog(PRINT_NORMAL, __VA_ARGS__)
+// Per-stage debug counters (avoid touching object fields)
+static int32 s_bssDebugTick        = 0;
+static int32 s_bssBootstrapFrames  = 0;
+static bool32 s_bssIntroHoldDone   = false;
+
 ObjectBSS_Setup *BSS_Setup;
 
 void BSS_Setup_Update(void)
@@ -17,6 +26,84 @@ void BSS_Setup_Update(void)
     StateMachine_Run(self->state);
 
     ScreenInfo->position.x = 0x100 - ScreenInfo->center.x;
+
+    // ---- HUD safe-scaling for square / narrow viewports (UI only) ----
+    // RSDK scale uses 0x200 as 1.0. We never upscale beyond 1.0.
+    {
+        const int32 hudBaseW = 320; // BSS HUD/layout was authored for 320 px wide (4:3)
+        int32 uiScale = 0x200;      // 1.0
+        if (ScreenInfo->size.x < hudBaseW) {
+            // Scale proportionally to width (e.g., 240x240 => 240/320 = 0.75 => 0x180)
+            uiScale = (ScreenInfo->size.x * 0x200) / hudBaseW;
+        }
+        static int32 s_lastUiScale = -1;
+        if (uiScale != s_lastUiScale) {
+            s_lastUiScale = uiScale;
+            // Scale BSS messages (GET BLUE SPHERES / PERFECT / FINISHED)
+            foreach_active(BSS_Message, msg) {
+                msg->drawFX |= FX_SCALE;
+                msg->scale.x = uiScale;
+                msg->scale.y = uiScale;
+            }
+            // Scale pause overlay as well (so "PAUSE" fits on 1:1)
+            foreach_active(PauseMenu, pm) {
+                pm->drawFX |= FX_SCALE;
+                pm->scale.x = uiScale;
+                pm->scale.y = uiScale;
+            }
+            if (((s_bssDebugTick) & 0x0F) == 0) {
+                BSS_LOG("[BSS] HUD scale applied: 0x%X (screenW=%d)", uiScale, ScreenInfo->size.x);
+            }
+        }
+    }
+
+    // ---- Auto-bootstrap if the "GET BLUE SPHERES" message never armed motion ----
+    // (but only after the intro message disappears)
+    if (!self->stopMovement && !self->speedupLevel && !self->globeSpeed) {
+        if (++s_bssBootstrapFrames == 1 || (s_bssBootstrapFrames % 30) == 0) {
+            BSS_LOG("[BSS] Motion disarmed for %d frames (speedup=%d, speed=%d, inc=%d)",
+                    s_bssBootstrapFrames, self->speedupLevel, self->globeSpeed, self->globeSpeedInc);
+        }
+        if (s_bssBootstrapFrames >= 10) { // ~0.16s at 60fps
+            self->speedupLevel  = 16;
+            self->globeSpeed    = 16;
+            self->globeSpeedInc = 2;
+            s_bssBootstrapFrames = 0;
+            BSS_LOG("[BSS] Auto-armed movement → speedup=16 speed=16 inc=2");
+            // Ensure the player shows the running anim immediately if on ground
+            {
+                EntityBSS_Player *p1 = RSDK_GET_ENTITY(SLOT_PLAYER1, BSS_Player);
+                if (p1 && p1->onGround) {
+                    RSDK.SetSpriteAnimation(p1->aniFrames, 1, &p1->animator, false, 0);
+                    BSS_LOG("[BSS] Auto-armed: set player run animation");
+                }
+            }
+        }
+    } else {
+        if (s_bssBootstrapFrames) {
+            BSS_LOG("[BSS] Motion armed externally after %d frames; cancelling auto-bootstrap",
+                    s_bssBootstrapFrames);
+        }
+        s_bssBootstrapFrames = 0;
+    }
+
+    // ---- Verbose tick (4×/sec) ----
+    if (((++s_bssDebugTick) & 0x0F) == 0) {
+        TileLayer *bg    = RSDK.GetTileLayer(BSS_Setup->bgLayer);
+        TileLayer *globe = RSDK.GetTileLayer(BSS_Setup->globeLayer);
+        EntityBSS_Player *p1 = RSDK_GET_ENTITY(SLOT_PLAYER1, BSS_Player);
+        BSS_LOG("[BSS] tick: state=%p onGround=%d  speed=%d/%d(+%d)  timer=%d line=%d page=%d  angle=%d "
+                "pos=(%u,%u)  bgScroll=%d drawGroup0=%d  SCR center=(%d,%d) pos=(%d,%d) size=(%d,%d)",
+                self->state, p1 ? p1->onGround : -1,
+                self->globeSpeed, self->speedupLevel, self->globeSpeedInc,
+                self->globeTimer, self->paletteLine, self->palettePage, self->angle,
+                self->playerPos.x, self->playerPos.y,
+                bg ? bg->scrollInfo[0].scrollPos : 0,
+                globe ? globe->drawGroup[0] : -1,
+                ScreenInfo->center.x, ScreenInfo->center.y,
+                ScreenInfo->position.x, ScreenInfo->position.y,
+                ScreenInfo->size.x, ScreenInfo->size.y);
+    }
 
     if (self->palettePage) {
         RSDK.CopyPalette(2, 16 * self->paletteLine, 0, 128, 16);
@@ -59,7 +146,8 @@ void BSS_Setup_Create(void *data)
     RSDK_THIS(BSS_Setup);
 
     if (!SceneInfo->inEditor) {
-        self->active          = ACTIVE_BOUNDS;
+        // Tick even when offscreen but respect pause (fixes pause-keep-running issue)
+        self->active          = ACTIVE_NORMAL;
         self->visible         = true;
         self->drawGroup       = 2;
         self->drawFX          = FX_FLIP;
@@ -67,13 +155,17 @@ void BSS_Setup_Create(void *data)
         self->updateRange.x   = TO_FIXED(128);
         self->updateRange.y   = TO_FIXED(128);
         self->speedupInterval = 30 * 60; // speed up every 30 seconds
-        self->stopMovement    = false;
+        self->stopMovement    = true;
 
         RSDK.SetSpriteAnimation(BSS_Setup->globeFrames, 0, &self->globeSpinAnimator, true, 0);
         RSDK.SetSpriteAnimation(BSS_Setup->globeFrames, 1, &self->shadowAnimator, true, 0);
 
         BSS_Setup_GetStartupInfo();
-
+        // Prime camera X so first frame is centered even if Update() is delayed
+        ScreenInfo->position.x = 0x100 - ScreenInfo->center.x;
+        BSS_LOG("[BSS] Create: spawn angle=%d playerPos=(%u,%u) sphereCount=%d pinkCount=%d ringCount=%d (active=NORMAL)",
+                self->angle, self->playerPos.x, self->playerPos.y,
+                BSS_Setup->sphereCount, BSS_Setup->pinkSphereCount, BSS_Setup->ringCount);
         self->state = BSS_Setup_State_GlobeMoveZ;
     }
 }
@@ -89,8 +181,21 @@ void BSS_Setup_StageLoad(void)
     BSS_Setup->playFieldLayer = RSDK.GetTileLayerID("Playfield");
     BSS_Setup->ringCountLayer = RSDK.GetTileLayerID("Ring Count");
 
+    s_bssDebugTick = 0;
+    s_bssBootstrapFrames = 0;
+    BSS_LOG("[BSS] StageLoad: screen %dx%d center=(%d,%d) pos=(%d,%d) layers(bg=%d globe=%d f1=%d f2=%d play=%d ring=%d)",
+            ScreenInfo->size.x, ScreenInfo->size.y,
+            ScreenInfo->center.x, ScreenInfo->center.y,
+            ScreenInfo->position.x, ScreenInfo->position.y,
+            BSS_Setup->bgLayer, BSS_Setup->globeLayer, BSS_Setup->frustum1Layer, BSS_Setup->frustum2Layer,
+            BSS_Setup->playFieldLayer, BSS_Setup->ringCountLayer);
+
     BSS_Setup_SetupFrustum();
     BSS_Setup->ringCount = 0;
+
+    BSS_LOG("[BSS] Frustum: f1 count=%d off=%d | f2 count=%d off=%d",
+            BSS_Setup->frustumCount[0], BSS_Setup->frustumOffset[0],
+            BSS_Setup->frustumCount[1], BSS_Setup->frustumOffset[1]);
 
     TileLayer *playField = RSDK.GetTileLayer(BSS_Setup->playFieldLayer);
 
@@ -219,6 +324,15 @@ void BSS_Setup_StageLoad(void)
     BSS_Setup->sfxMedalCaught = RSDK.GetSfx("Special/MedalCaught.wav");
     BSS_Setup->sfxTeleport    = RSDK.GetSfx("Global/Teleport.wav");
 
+    // ---- Safety: ensure the bootstrap UI exists (some mod/data setups skip it) ----
+    bool32 hasMsg = false;
+    foreach_active(BSS_Message, m) { hasMsg = true; break; }
+    BSS_LOG("[BSS] StageLoad: message present after scene load? %s", hasMsg ? "yes" : "no");
+    if (!hasMsg) {
+        CREATE_ENTITY(BSS_Message, INT_TO_VOID(BSS_MESSAGE_GETSPHERES), TO_FIXED(256), TO_FIXED(128));
+        BSS_LOG("[BSS] StageLoad: created GET BLUE SPHERES message at (256,128)");
+    }
+
     EntityMenuParam *param = MenuParam_GetParam();
     if (param->bssSelection == BSS_SELECTION_EXTRAS) {
         String string;
@@ -325,6 +439,9 @@ void BSS_Setup_SetupFrustum(void)
     for (int32 i = RESERVE_ENTITY_COUNT; i < RESERVE_ENTITY_COUNT + 0x60; ++i) {
         RSDK.ResetEntitySlot(i, BSS_Collectable->classID, NULL);
     }
+    BSS_LOG("[BSS] SetupFrustum: finalized f1 count=%d off=%d | f2 count=%d off=%d",
+            BSS_Setup->frustumCount[0], BSS_Setup->frustumOffset[0],
+            BSS_Setup->frustumCount[1], BSS_Setup->frustumOffset[1]);
 }
 
 void BSS_Setup_CollectRing(void)
@@ -404,6 +521,10 @@ void BSS_Setup_GetStartupInfo(void)
     }
 
     RSDK.GetTileLayer(BSS_Setup->bgLayer)->scrollInfo[0].scrollPos = self->angle << 18;
+    BSS_LOG("[BSS] GetStartupInfo: spawn angle=%d playerPos=(%u,%u) spheres=%d pinks=%d ringCount=%d bgScroll=%d",
+            self->angle, self->playerPos.x, self->playerPos.y,
+            BSS_Setup->sphereCount, BSS_Setup->pinkSphereCount, BSS_Setup->ringCount,
+            RSDK.GetTileLayer(BSS_Setup->bgLayer)->scrollInfo[0].scrollPos);
 }
 
 void BSS_Setup_State_GlobeJettison(void)
@@ -799,6 +920,14 @@ void BSS_Setup_HandleCollectableMovement(void)
     while (slot < RESERVE_ENTITY_COUNT + 0x80) {
         RSDK_GET_ENTITY(slot++, BSS_Collectable)->classID = TYPE_BLANK;
     }
+    if ( (s_bssDebugTick & 0x0F) == 0 ) {
+        int32 active = 0;
+        for (int32 i = RESERVE_ENTITY_COUNT; i < RESERVE_ENTITY_COUNT + 0x80; ++i) {
+            if (RSDK_GET_ENTITY(i, BSS_Collectable)->classID != TYPE_BLANK) ++active;
+        }
+        BSS_LOG("[BSS] Collectables: active=%d  angle=%d line=%d offsetDir=%d",
+                active, self->angle, self->paletteLine, self->offsetDir);
+    }
 }
 
 void BSS_Setup_State_GlobeEmerald(void)
@@ -828,11 +957,16 @@ void BSS_Setup_State_GlobeEmerald(void)
 
     self->playerPos.x &= 0x1F;
     self->playerPos.y &= 0x1F;
+    BSS_LOG("[BSS] Step+ : angle=%d pos=(%u,%u) speed=%d timer=%d page=%d",
+        self->angle, self->playerPos.x, self->playerPos.y, self->globeSpeed, self->globeTimer, self->palettePage);
+
     self->paletteLine = (self->globeTimer >> 4) & 0xF;
 
     TileLayer *background = RSDK.GetTileLayer(BSS_Setup->bgLayer);
     background->scrollPos += self->globeSpeed << 14;
-
+        if ( (s_bssDebugTick & 0x0F) == 0 ) {
+            BSS_LOG("[BSS] Scroll: bgScroll=%d  speed=%d", background->scrollPos, self->globeSpeed);
+        }
     BSS_Setup_HandleCollectableMovement();
 }
 
@@ -942,6 +1076,9 @@ void BSS_Setup_State_GlobeExit(void)
 
         self->angle -= 8;
         self->angle &= 0xFF;
+    if ( (s_bssDebugTick & 0x0F) == 0 ) {
+        BSS_LOG("[BSS] TurnLeft: angle=%d spinTimer=%d", self->angle, self->spinTimer);
+    }
     }
 
     TileLayer *globe = RSDK.GetTileLayer(BSS_Setup->globeLayer);
@@ -968,6 +1105,37 @@ void BSS_Setup_State_GlobeMoveZ(void)
     RSDK_THIS(BSS_Setup);
 
     EntityBSS_Player *player1 = RSDK_GET_ENTITY(SLOT_PLAYER1, BSS_Player);
+
+    // ---- Hold start until the intro message goes away (one-shot) ----
+    if (self->stopMovement && !s_bssIntroHoldDone) {
+        bool32 hasIntro = false;
+        foreach_active(BSS_Message, m) { hasIntro = true; break; }
+        // Keep Sonic in idle while waiting
+        if (player1 && player1->onGround) {
+            RSDK.SetSpriteAnimation(player1->aniFrames, 0, &player1->animator, true, 0);
+        }
+        if (!hasIntro) {
+            self->stopMovement = false;
+            s_bssIntroHoldDone = true;
+            if (!self->speedupLevel && !self->globeSpeed) {
+                self->speedupLevel  = 16;
+                self->globeSpeed    = 16;
+                self->globeSpeedInc = 2;
+                if (player1 && player1->onGround) {
+                    RSDK.SetSpriteAnimation(player1->aniFrames, 1, &player1->animator, false, 0);
+                }
+                BSS_LOG("[BSS] Intro cleared → releasing hold and arming motion (16/16/+2)");
+            } else {
+                BSS_LOG("[BSS] Intro cleared → releasing hold (motion already armed)");
+            }
+        } else {
+            // Still holding — no movement or timers advance
+            if (((s_bssDebugTick) & 0x0F) == 0) {
+                BSS_LOG("[BSS] Holding for intro… globeSpeed=%d timer=%d", self->globeSpeed, self->globeTimer);
+            }
+            return;
+        }
+    }
 
     if (self->speedupLevel < 32 && ++self->speedupTimer >= self->speedupInterval) {
         self->speedupTimer = 0;
@@ -1026,6 +1194,9 @@ void BSS_Setup_State_GlobeMoveZ(void)
                 self->playerPos.x &= 0x1F;
                 self->playerPos.y -= RSDK.Cos256(self->angle) >> 8;
                 self->playerPos.y &= 0x1F;
+                BSS_LOG("[BSS] Step+ : angle=%d pos=(%u,%u) speed=%d timer=%d page=%d",
+                        self->angle, self->playerPos.x, self->playerPos.y,
+                        self->globeSpeed, self->globeTimer, self->palettePage);
             }
         }
         else if (self->globeTimer < 0) {
@@ -1057,6 +1228,9 @@ void BSS_Setup_State_GlobeMoveZ(void)
 
         TileLayer *background = RSDK.GetTileLayer(BSS_Setup->bgLayer);
         background->scrollPos += self->globeSpeed << 14;
+        if ((s_bssDebugTick & 0x0F) == 0) {
+            BSS_LOG("[BSS] Scroll: bgScroll=%d  speed=%d", background->scrollPos, self->globeSpeed);
+        }
     }
 
     self->paletteLine = (self->globeTimer >> 4) & 0xF;
@@ -1077,6 +1251,9 @@ void BSS_Setup_State_GlobeTurnLeft(void)
 
     self->angle -= 4;
     self->angle &= 0xFF;
+    if ((s_bssDebugTick & 0x0F) == 0) {
+        BSS_LOG("[BSS] TurnLeft: angle=%d spinTimer=%d", self->angle, self->spinTimer);
+    }
 
     TileLayer *globe = RSDK.GetTileLayer(BSS_Setup->globeLayer);
     if (self->spinTimer == 15) {
@@ -1088,6 +1265,7 @@ void BSS_Setup_State_GlobeTurnLeft(void)
             self->state = BSS_Setup_State_GlobeMoveZ;
         else
             self->state = BSS_Setup_State_FinishGlobeTeleport;
+        BSS_LOG("[BSS] TurnLeft: finish → state=%p timer=%d", self->state, self->timer);
 
         BSS_Setup_HandleCollectableMovement();
     }
@@ -1118,7 +1296,9 @@ void BSS_Setup_State_GlobeTurnRight(void)
 
     self->angle += 4;
     self->angle &= 0xFF;
-
+    if ( (s_bssDebugTick & 0x0F) == 0 ) {
+        BSS_LOG("[BSS] TurnRight: angle=%d spinTimer=%d", self->angle, self->spinTimer);
+    }
     TileLayer *globe = RSDK.GetTileLayer(BSS_Setup->globeLayer);
     if (self->spinTimer == 15) {
         globe->drawGroup[0] = 1;
@@ -1128,7 +1308,7 @@ void BSS_Setup_State_GlobeTurnRight(void)
             self->state = BSS_Setup_State_GlobeMoveZ;
         else
             self->state = BSS_Setup_State_FinishGlobeTeleport;
-
+        BSS_LOG("[BSS] TurnRight: finish → state=%p timer=%d", self->state, self->timer);
         BSS_Setup_HandleCollectableMovement();
     }
     else {
