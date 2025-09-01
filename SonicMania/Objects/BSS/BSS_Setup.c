@@ -20,6 +20,8 @@ static int32 s_bssIntroWarmupFrames = 0;
 static int32 s_holdSavedSpeed      = 0;
 static int32 s_holdSavedLevel      = 0;
 static int32 s_holdSavedInc        = 0;
+static bool32 s_bssIntroEarlyStart = false;
+static bool32 s_bssAnimLockUntilMove = false;
 
 ObjectBSS_Setup *BSS_Setup;
 
@@ -76,7 +78,7 @@ void BSS_Setup_Update(void)
             BSS_LOG("[BSS] Motion disarmed for %d frames (speedup=%d, speed=%d, inc=%d)",
                     s_bssBootstrapFrames, self->speedupLevel, self->globeSpeed, self->globeSpeedInc);
         }
-        if (s_bssBootstrapFrames >= 60) { // ~1.0s after intro, last-resort safety
+        if (s_bssBootstrapFrames >= 16) {
             self->speedupLevel   = 16;
             self->globeSpeed     = 16;
             self->globeSpeedInc  = 2;
@@ -197,6 +199,8 @@ void BSS_Setup_StageLoad(void)
     s_bssBootstrapFrames = 0;
     s_bssIntroHoldDone = false;
     s_bssIntroWarmupFrames = 3; // ~3 frames to ensure BSS_Message gets created & activated
+    s_bssIntroEarlyStart = false;
+    s_bssAnimLockUntilMove = false;
     // Clear any stashed motion from a previous run
     s_holdSavedSpeed = 0;
     s_holdSavedLevel = 0;
@@ -1124,10 +1128,30 @@ void BSS_Setup_State_GlobeMoveZ(void)
 
     EntityBSS_Player *player1 = RSDK_GET_ENTITY(SLOT_PLAYER1, BSS_Player);
 
-    // ---- Hold start until the intro message goes away (one-shot) ----
+    // ---- Hold start until the intro message goes away (one-shot),
+    //      but allow EARLY START if the player holds UP. ----
     if (self->stopMovement && !s_bssIntroHoldDone) {
+        // Early start: holding UP should immediately allow movement (legacy behavior)
+        if (player1 && player1->up) {
+            s_bssIntroEarlyStart = true;
+            self->stopMovement   = false;
+            s_bssIntroHoldDone   = true;
+            // Seed SAME motion as post-intro start so speed matches immediately
+            self->globeSpeed    = 16;
+            self->speedupLevel  = 16;
+            self->globeSpeedInc = 2;
+            self->speedupTimer  = 0;   // prevent an immediate speedup tick
+            s_bssBootstrapFrames = 0;  // cancel any pending bootstrap path
+            s_bssAnimLockUntilMove = false; // early start runs immediately
+            // Show running anim immediately if grounded
+            if (player1->onGround)
+                RSDK.SetSpriteAnimation(player1->aniFrames, 1, &player1->animator, false, 0);
+            BSS_LOG("[BSS] Early start: UP pressed → release hold (speed=%d level=%d inc=%d)",
+                    self->globeSpeed, self->speedupLevel, self->globeSpeedInc);
+        }
+        
         // Warm-up a few frames so the message entity is definitely active before we query.
-        if (s_bssIntroWarmupFrames > 0) {
+        if (s_bssIntroWarmupFrames > 0 && !s_bssIntroEarlyStart) {
             --s_bssIntroWarmupFrames;
             if (((s_bssDebugTick) & 0x0F) == 0) {
                 BSS_LOG("[BSS] Warm-up… (%d) holding for intro spawn", s_bssIntroWarmupFrames);
@@ -1142,16 +1166,19 @@ void BSS_Setup_State_GlobeMoveZ(void)
         bool32 hasIntro = false;
         foreach_active(BSS_Message, m) { hasIntro = true; break; }
 
-        if (!hasIntro) {
+        if (!hasIntro || s_bssIntroEarlyStart) {
             self->stopMovement = false;
             s_bssIntroHoldDone = true;
+            // In the normal auto-start path, lock animation to idle until motion really begins
+            if (!s_bssIntroEarlyStart)
+                s_bssAnimLockUntilMove = true;
             // Restore any motion that armed while the intro was visible
-            if (s_holdSavedSpeed > 0 || s_holdSavedLevel > 0) {
+            // (but DON'T override our early-start seeding)
+            if (!s_bssIntroEarlyStart && (s_holdSavedSpeed > 0 || s_holdSavedLevel > 0)) {
                 self->globeSpeed    = s_holdSavedSpeed;
                 self->speedupLevel  = s_holdSavedLevel;
-                if (s_holdSavedInc) {
+                if (s_holdSavedInc)
                     self->globeSpeedInc = s_holdSavedInc;
-                }
             }
             s_holdSavedSpeed = 0;
             s_holdSavedLevel = 0;
@@ -1175,8 +1202,9 @@ void BSS_Setup_State_GlobeMoveZ(void)
             if (player1 && player1->onGround && player1->animator.animationID != 0) {
                 RSDK.SetSpriteAnimation(player1->aniFrames, 0, &player1->animator, true, 0);
             }
-            // Still holding — if motion armed under the message, stash & zero it to avoid run→idle flicker
-            if (self->globeSpeed > 0 || self->speedupLevel > 0) {
+            // Still holding — if motion armed under the message, stash & zero it
+            // (but NOT when early start is allowed)
+            if (!s_bssIntroEarlyStart && (self->globeSpeed > 0 || self->speedupLevel > 0)) {
                 if (!s_holdSavedSpeed && !s_holdSavedLevel) {
                     s_holdSavedSpeed = self->globeSpeed;
                     s_holdSavedLevel = self->speedupLevel;
@@ -1193,7 +1221,9 @@ void BSS_Setup_State_GlobeMoveZ(void)
             RSDK.GetTileLayer(BSS_Setup->globeLayer)->drawGroup[0] = 1;
             self->paletteLine = (self->globeTimer >> 4) & 0xF;
             BSS_Setup_HandleCollectableMovement();
-            return;
+            // If early start is active, do NOT return — allow motion to progress immediately.
+            if (!s_bssIntroEarlyStart)
+                return;
         }
     }
 
@@ -1218,14 +1248,28 @@ void BSS_Setup_State_GlobeMoveZ(void)
     // Do not override airborne/spring animations (only act when onGround).
     if (player1) {
         if (player1->onGround) {
-            // ani 0 = idle, ani 1 = run in Mania assets
-            uint8 desiredAnim = (self->globeSpeed > 0) ? 1 : 0;
-            // Only swap if different to avoid restarting the same anim every frame.
-            if (player1->animator.animationID != desiredAnim) {
-                RSDK.SetSpriteAnimation(player1->aniFrames,
-                                        desiredAnim,
-                                        &player1->animator,
-                                        (desiredAnim == 0), 0);
+            // Debounce: while locked, force idle until motion really begins; then unlock and set run once.
+            if (s_bssAnimLockUntilMove) {
+                if (self->globeSpeed <= 0) {
+                    if (player1->animator.animationID != 0) {
+                        RSDK.SetSpriteAnimation(player1->aniFrames, 0, &player1->animator, true, 0);
+                    }
+                } else {
+                    s_bssAnimLockUntilMove = false;
+                    if (player1->animator.animationID != 1) {
+                        RSDK.SetSpriteAnimation(player1->aniFrames, 1, &player1->animator, false, 0);
+                    }
+                }
+            } else {
+                // ani 0 = idle, ani 1 = run in Mania assets
+                uint8 desiredAnim = (self->globeSpeed > 0) ? 1 : 0;
+                // Only swap if different to avoid restarting the same anim every frame.
+                if (player1->animator.animationID != desiredAnim) {
+                    RSDK.SetSpriteAnimation(player1->aniFrames,
+                                            desiredAnim,
+                                            &player1->animator,
+                                            (desiredAnim == 0), 0);
+                }
             }
         }
     }
@@ -1872,3 +1916,51 @@ void BSS_Setup_EditorLoad(void)
 #endif
 
 void BSS_Setup_Serialize(void) { RSDK_EDITABLE_VAR(BSS_Setup, VAR_UINT8, paletteID); }
+
+
+// ---------------------------------------------------------------------
+// Cheat helper: instantly collect all rings & spheres and finish stage
+// Pressed via BSS_Player (SELECT). Sweeps playfield and triggers normal
+// ring/sphere collection hooks so HUD/Perfect/sfx behave correctly.
+// ---------------------------------------------------------------------
+void BSS_Setup_CheatCollectAll(void)
+{
+    EntityBSS_Setup *self = RSDK_GET_ENTITY(SLOT_BSS_SETUP, BSS_Setup);
+    if (!self)
+        return;
+
+    // 1) Collect every ring and blue sphere
+    for (int y = 0; y < BSS_PLAYFIELD_H; ++y) {
+        for (int x = 0; x < BSS_PLAYFIELD_W; ++x) {
+            int idx = y * BSS_PLAYFIELD_W + x;
+            switch (BSS_Setup->playField[idx]) {
+                case BSS_RING:
+                    // consume ring and update counters/HUD
+                    CREATE_ENTITY(BSS_Collected, INT_TO_VOID(BSS_COLLECTED_RING), x, y);
+                    BSS_Setup->playField[idx] = BSS_RING_SPARKLE;
+                    BSS_Setup_CollectRing();
+                    if (BSS_Setup->ringCount > 0)
+                        --BSS_Setup->ringCount;
+                    break;
+
+                case BSS_SPHERE_BLUE:
+                    CREATE_ENTITY(BSS_Collected, INT_TO_VOID(BSS_COLLECTED_BLUE), x, y);
+                    BSS_Setup->playField[idx] = BSS_BLUE_STOOD;
+                    if (BSS_Setup->sphereCount > 0)
+                        --BSS_Setup->sphereCount;
+                    break;
+
+                default: break;
+            }
+        }
+    }
+
+    // 2) Ensure counters read as fully collected
+    BSS_Setup->sphereCount = 0;
+    BSS_Setup->ringCount   = 0;
+
+    // 3) Begin normal finish sequence (identical to last-sphere clear)
+    self->state = BSS_Setup_State_GlobeJettison;
+    RSDK.PlaySfx(BSS_Setup->sfxSSJettison, false, 255);
+    Music_FadeOut(0.0125);
+}

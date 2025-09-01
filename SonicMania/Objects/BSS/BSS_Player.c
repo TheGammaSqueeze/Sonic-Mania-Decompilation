@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------
 
 #include "Game.h"
+#include "BSS_Setup.h"
 
 ObjectBSS_Player *BSS_Player;
 
@@ -197,6 +198,13 @@ void BSS_Player_Input_P1(void)
             self->right = false;
         }
         self->jumpPress = controller->keyA.press || controller->keyB.press || controller->keyC.press || controller->keyX.press;
+        // --- Cheat: SELECT to collect all rings & spheres and finish stage ---
+        if (controller->keySelect.press && SceneInfo->state == ENGINESTATE_REGULAR) {
+            // Small feedback so it's obvious the cheat fired
+            RSDK.PlaySfx(BSS_Player->sfxJump, false, 255);
+            BSS_Setup_CheatCollectAll();
+        }
+
 
         if (controller->keyStart.press || Unknown_pausePress) {
             if (SceneInfo->state == ENGINESTATE_REGULAR) {
