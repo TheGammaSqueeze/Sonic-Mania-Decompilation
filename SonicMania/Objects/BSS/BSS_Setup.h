@@ -3,6 +3,9 @@
 
 #include "Game.h"
 
+// Cheat helper: instantly collect all rings & spheres and finish
+void BSS_Setup_CheatCollectAll(void);
+
 #define BSS_PLAYFIELD_W (0x20)
 #define BSS_PLAYFIELD_H (0x20)
 
