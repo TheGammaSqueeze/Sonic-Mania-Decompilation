@@ -16,6 +16,10 @@
 static int32 s_bssDebugTick        = 0;
 static int32 s_bssBootstrapFrames  = 0;
 static bool32 s_bssIntroHoldDone   = false;
+static int32 s_bssIntroWarmupFrames = 0;
+static int32 s_holdSavedSpeed      = 0;
+static int32 s_holdSavedLevel      = 0;
+static int32 s_holdSavedInc        = 0;
 
 ObjectBSS_Setup *BSS_Setup;
 
@@ -57,17 +61,25 @@ void BSS_Setup_Update(void)
         }
     }
 
-    // ---- Auto-bootstrap if the "GET BLUE SPHERES" message never armed motion ----
-    // (but only after the intro message disappears)
-    if (!self->stopMovement && !self->speedupLevel && !self->globeSpeed) {
+    // ---- Auto-bootstrap only if the intro finished AND motion never got armed ----
+    // We additionally require that our warm-up has elapsed so the message could spawn.
+    bool32 introShowing = false;
+    if (s_bssIntroWarmupFrames <= 0) {
+        foreach_active(BSS_Message, msgIntro) {
+            if (msgIntro->timer > 0) { introShowing = true; break; }
+        }
+    } else {
+        introShowing = true; // during warm-up, pretend it's showing to prevent arming
+    }
+    if (s_bssIntroHoldDone && !introShowing && !self->stopMovement && !self->globeSpeed && !self->speedupLevel) {
         if (++s_bssBootstrapFrames == 1 || (s_bssBootstrapFrames % 30) == 0) {
             BSS_LOG("[BSS] Motion disarmed for %d frames (speedup=%d, speed=%d, inc=%d)",
                     s_bssBootstrapFrames, self->speedupLevel, self->globeSpeed, self->globeSpeedInc);
         }
-        if (s_bssBootstrapFrames >= 10) { // ~0.16s at 60fps
-            self->speedupLevel  = 16;
-            self->globeSpeed    = 16;
-            self->globeSpeedInc = 2;
+        if (s_bssBootstrapFrames >= 60) { // ~1.0s after intro, last-resort safety
+            self->speedupLevel   = 16;
+            self->globeSpeed     = 16;
+            self->globeSpeedInc  = 2;
             s_bssBootstrapFrames = 0;
             BSS_LOG("[BSS] Auto-armed movement → speedup=16 speed=16 inc=2");
             // Ensure the player shows the running anim immediately if on ground
@@ -80,7 +92,7 @@ void BSS_Setup_Update(void)
             }
         }
     } else {
-        if (s_bssBootstrapFrames) {
+        if (s_bssBootstrapFrames && (s_bssIntroHoldDone || !introShowing)) {
             BSS_LOG("[BSS] Motion armed externally after %d frames; cancelling auto-bootstrap",
                     s_bssBootstrapFrames);
         }
@@ -183,6 +195,12 @@ void BSS_Setup_StageLoad(void)
 
     s_bssDebugTick = 0;
     s_bssBootstrapFrames = 0;
+    s_bssIntroHoldDone = false;
+    s_bssIntroWarmupFrames = 3; // ~3 frames to ensure BSS_Message gets created & activated
+    // Clear any stashed motion from a previous run
+    s_holdSavedSpeed = 0;
+    s_holdSavedLevel = 0;
+    s_holdSavedInc   = 0;
     BSS_LOG("[BSS] StageLoad: screen %dx%d center=(%d,%d) pos=(%d,%d) layers(bg=%d globe=%d f1=%d f2=%d play=%d ring=%d)",
             ScreenInfo->size.x, ScreenInfo->size.y,
             ScreenInfo->center.x, ScreenInfo->center.y,
@@ -1108,31 +1126,73 @@ void BSS_Setup_State_GlobeMoveZ(void)
 
     // ---- Hold start until the intro message goes away (one-shot) ----
     if (self->stopMovement && !s_bssIntroHoldDone) {
+        // Warm-up a few frames so the message entity is definitely active before we query.
+        if (s_bssIntroWarmupFrames > 0) {
+            --s_bssIntroWarmupFrames;
+            if (((s_bssDebugTick) & 0x0F) == 0) {
+                BSS_LOG("[BSS] Warm-up… (%d) holding for intro spawn", s_bssIntroWarmupFrames);
+            }
+            // Ensure spheres are visible while holding: draw globe layer and project collectables once
+            RSDK.GetTileLayer(BSS_Setup->globeLayer)->drawGroup[0] = 1;
+            self->paletteLine = (self->globeTimer >> 4) & 0xF;
+            BSS_Setup_HandleCollectableMovement();
+            return;
+        }
+
         bool32 hasIntro = false;
         foreach_active(BSS_Message, m) { hasIntro = true; break; }
-        // Keep Sonic in idle while waiting
-        if (player1 && player1->onGround) {
-            RSDK.SetSpriteAnimation(player1->aniFrames, 0, &player1->animator, true, 0);
-        }
+
         if (!hasIntro) {
             self->stopMovement = false;
             s_bssIntroHoldDone = true;
-            if (!self->speedupLevel && !self->globeSpeed) {
-                self->speedupLevel  = 16;
-                self->globeSpeed    = 16;
-                self->globeSpeedInc = 2;
-                if (player1 && player1->onGround) {
-                    RSDK.SetSpriteAnimation(player1->aniFrames, 1, &player1->animator, false, 0);
+            // Restore any motion that armed while the intro was visible
+            if (s_holdSavedSpeed > 0 || s_holdSavedLevel > 0) {
+                self->globeSpeed    = s_holdSavedSpeed;
+                self->speedupLevel  = s_holdSavedLevel;
+                if (s_holdSavedInc) {
+                    self->globeSpeedInc = s_holdSavedInc;
                 }
-                BSS_LOG("[BSS] Intro cleared → releasing hold and arming motion (16/16/+2)");
-            } else {
-                BSS_LOG("[BSS] Intro cleared → releasing hold (motion already armed)");
             }
+            s_holdSavedSpeed = 0;
+            s_holdSavedLevel = 0;
+            s_holdSavedInc   = 0;
+
+            // Set the correct animation for the actual motion state on the release frame
+            if (player1 && player1->onGround) {
+                const uint8 desiredAnim = (self->globeSpeed > 0) ? 1 : 0; // 0=idle, 1=run
+                if (player1->animator.animationID != desiredAnim) {
+                    RSDK.SetSpriteAnimation(player1->aniFrames,
+                                            desiredAnim,
+                                            &player1->animator,
+                                            /*loop=*/(desiredAnim == 0),
+                                            /*frame=*/0);
+                }
+            }
+            BSS_LOG("[BSS] Intro cleared → releasing hold (restored speed=%d level=%d inc=%d)",
+                    self->globeSpeed, self->speedupLevel, self->globeSpeedInc);
         } else {
-            // Still holding — no movement or timers advance
-            if (((s_bssDebugTick) & 0x0F) == 0) {
-                BSS_LOG("[BSS] Holding for intro… globeSpeed=%d timer=%d", self->globeSpeed, self->globeTimer);
+            // Keep Sonic idle while the intro is on-screen (only if not already idle)
+            if (player1 && player1->onGround && player1->animator.animationID != 0) {
+                RSDK.SetSpriteAnimation(player1->aniFrames, 0, &player1->animator, true, 0);
             }
+            // Still holding — if motion armed under the message, stash & zero it to avoid run→idle flicker
+            if (self->globeSpeed > 0 || self->speedupLevel > 0) {
+                if (!s_holdSavedSpeed && !s_holdSavedLevel) {
+                    s_holdSavedSpeed = self->globeSpeed;
+                    s_holdSavedLevel = self->speedupLevel;
+                    s_holdSavedInc   = self->globeSpeedInc;
+                }
+                self->globeSpeed   = 0;
+                self->speedupLevel = 0;
+                // keep globeSpeedInc as-is; we restore the saved value on release
+            }
+            if (((s_bssDebugTick) & 0x0F) == 0)
+                BSS_LOG("[BSS] Holding for intro… globeSpeed=%d timer=%d", self->globeSpeed, self->globeTimer);
+
+            // Ensure spheres are visible while the intro message is on-screen
+            RSDK.GetTileLayer(BSS_Setup->globeLayer)->drawGroup[0] = 1;
+            self->paletteLine = (self->globeTimer >> 4) & 0xF;
+            BSS_Setup_HandleCollectableMovement();
             return;
         }
     }
@@ -1151,6 +1211,23 @@ void BSS_Setup_State_GlobeMoveZ(void)
     else {
         if (self->globeSpeed < self->speedupLevel)
             self->globeSpeed += self->globeSpeedInc;
+    }
+
+    // ---- Player animation governor (eliminate idle↔run flicker) ----
+    // Keep Sonic idle until actual forward motion (globeSpeed > 0). Switch to run once moving.
+    // Do not override airborne/spring animations (only act when onGround).
+    if (player1) {
+        if (player1->onGround) {
+            // ani 0 = idle, ani 1 = run in Mania assets
+            uint8 desiredAnim = (self->globeSpeed > 0) ? 1 : 0;
+            // Only swap if different to avoid restarting the same anim every frame.
+            if (player1->animator.animationID != desiredAnim) {
+                RSDK.SetSpriteAnimation(player1->aniFrames,
+                                        desiredAnim,
+                                        &player1->animator,
+                                        (desiredAnim == 0), 0);
+            }
+        }
     }
 
     if (player1->onGround) {
